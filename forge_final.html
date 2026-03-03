@@ -1047,6 +1047,7 @@
   <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/TransformControls.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/loaders/STLLoader.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/exporters/STLExporter.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/utils/BufferGeometryUtils.js"></script>
 
   <script>
     // ═══════════════════════════════════════════════════════════════
@@ -1066,7 +1067,7 @@
     const scene = new THREE.Scene();
     scene.background = new THREE.Color(0x0a0a0c);
 
-    scene.fog = new THREE.FogExp2(0x0a0a0c, 0.006);
+    // No fog — keep mesh shading clean at all distances
 
     const camera = new THREE.PerspectiveCamera(45, 1, 0.001, 2000);
     camera.position.set(8, 6, 10);
@@ -1080,12 +1081,22 @@
     transformControls.addEventListener('change', updatePanelFromMesh);
     scene.add(transformControls);
 
-    scene.add(new THREE.AmbientLight(0x222233, 2));
-    const keyLight = new THREE.DirectionalLight(0xffffff, 2.8);
-    keyLight.position.set(10, 20, 10); keyLight.castShadow = true; keyLight.shadow.mapSize.set(2048, 2048);
+    scene.add(new THREE.AmbientLight(0x333344, 2.2));
+    const keyLight = new THREE.DirectionalLight(0xffffff, 2.5);
+    keyLight.position.set(10, 20, 10);
+    keyLight.castShadow = true;
+    keyLight.shadow.mapSize.set(2048, 2048);
+    keyLight.shadow.bias = -0.0005;
+    keyLight.shadow.normalBias = 0.02;
+    keyLight.shadow.camera.near = 0.1;
+    keyLight.shadow.camera.far = 200;
+    keyLight.shadow.camera.left = -50;
+    keyLight.shadow.camera.right = 50;
+    keyLight.shadow.camera.top = 50;
+    keyLight.shadow.camera.bottom = -50;
     scene.add(keyLight);
-    const fill = new THREE.DirectionalLight(0x3344ff, 0.7); fill.position.set(-10, 5, -10); scene.add(fill);
-    const rim = new THREE.DirectionalLight(0xe8ff47, 0.35); rim.position.set(0, -5, -15); scene.add(rim);
+    const fill = new THREE.DirectionalLight(0x4466cc, 0.6); fill.position.set(-10, 5, -10); scene.add(fill);
+    const rim = new THREE.DirectionalLight(0xffffff, 0.3); rim.position.set(0, -5, -15); scene.add(rim);
 
     const grid = new THREE.GridHelper(200, 200, 0x383848, 0x252535); // Adjusted to 1mm by 1mm squares with original colors
     grid.material.transparent = true;
@@ -1109,6 +1120,9 @@
     const raycaster = new THREE.Raycaster();
     const mouse = new THREE.Vector2();
     let lastIntersect = null;
+    let adjacencyMap = null;
+    let meshDiagonal = 1;
+    let normalRecomputeTimer = null;
 
     // ═══════════════════════════════════════════════════════════════
     // AXIS INDICATOR
@@ -1332,6 +1346,32 @@
     }
 
     // ═══════════════════════════════════════════════════════════════
+    // VERTEX ADJACENCY (for Laplacian smooth)
+    // ═══════════════════════════════════════════════════════════════
+    function buildAdjacency(geometry) {
+      const count = geometry.attributes.position.count;
+      const neighbors = [];
+      for (let i = 0; i < count; i++) neighbors.push(new Set());
+      const index = geometry.index;
+      if (index) {
+        for (let i = 0; i < index.count; i += 3) {
+          const a = index.getX(i), b = index.getX(i + 1), c = index.getX(i + 2);
+          neighbors[a].add(b); neighbors[a].add(c);
+          neighbors[b].add(a); neighbors[b].add(c);
+          neighbors[c].add(a); neighbors[c].add(b);
+        }
+      } else {
+        for (let i = 0; i < count; i += 3) {
+          const a = i, b = i + 1, c = i + 2;
+          neighbors[a].add(b); neighbors[a].add(c);
+          neighbors[b].add(a); neighbors[b].add(c);
+          neighbors[c].add(a); neighbors[c].add(b);
+        }
+      }
+      return neighbors;
+    }
+
+    // ═══════════════════════════════════════════════════════════════
     // SCULPT
     // ═══════════════════════════════════════════════════════════════
     function updateBrush() {
@@ -1350,62 +1390,112 @@
     }
 
     let lastBrushLocal = null;
-    function sculpt(event, overrideHitPoint, overrideNormalLocal) {
-      if (!mesh) return;
-      let hitPoint, normalLocal;
-      const posAttr = mesh.geometry.attributes.position;
-      const invMatrix = new THREE.Matrix4().copy(mesh.matrixWorld).invert();
 
-      if (overrideHitPoint) {
-        hitPoint = overrideHitPoint;
-        normalLocal = overrideNormalLocal;
-      } else {
-        const rect = viewport.getBoundingClientRect();
-        mouse.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
-        mouse.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
-        raycaster.setFromCamera(mouse, camera);
-        const hits = raycaster.intersectObject(mesh);
-        if (!hits.length) return;
-        lastIntersect = hits[0];
-        hitPoint = hits[0].point.clone();
-        const hn = hits[0].face.normal.clone().transformDirection(mesh.matrixWorld).normalize();
-        normalLocal = hn.clone().transformDirection(invMatrix).normalize();
-      }
-      const hitLocal = hitPoint.clone().applyMatrix4(invMatrix);
-      const dir = currentTool === 'sculpt-push' ? -1 : 1;
+    // Per-stroke brush application: push/pull along per-vertex normals, smooth via Laplacian
+    function sculptStroke(brushPos, posAttr, normalAttr) {
       const v = new THREE.Vector3();
+      const dir = currentTool === 'sculpt-push' ? -1 : 1;
+      // Scale strength proportionally to mesh size so brush feels consistent
+      const scaledStrength = brushStrength * meshDiagonal * 0.15;
 
-      // Fill gaps when moving fast
-      const positions = [hitLocal.clone()];
-      if (lastBrushLocal) {
-        const gap = lastBrushLocal.distanceTo(hitLocal);
-        const steps = Math.ceil(gap / (brushRadius * 0.15));
-        for (let s = 1; s < steps; s++)
-          positions.unshift(lastBrushLocal.clone().lerp(hitLocal, s / steps));
-      }
-      lastBrushLocal = hitLocal.clone();
-
-      positions.forEach(brushPos => {
-        const smoothTargets = [];
+      if (currentTool === 'sculpt-smooth') {
+        // ── Laplacian smoothing using real vertex adjacency ──
+        if (!adjacencyMap) return;
+        const affected = [];
+        for (let i = 0; i < posAttr.count; i++) {
+          v.fromBufferAttribute(posAttr, i);
+          if (v.distanceTo(brushPos) <= brushRadius) affected.push(i);
+        }
+        // Clamp smooth factor for stability (never overshoot)
+        const smoothFactor = Math.min(brushStrength * 15, 0.75);
+        // Pre-compute all Laplacian targets before writing (Jacobi iteration)
+        const targets = [];
+        for (const idx of affected) {
+          const nbrs = adjacencyMap[idx];
+          if (!nbrs || nbrs.size === 0) continue;
+          let avgX = 0, avgY = 0, avgZ = 0;
+          for (const j of nbrs) {
+            avgX += posAttr.getX(j);
+            avgY += posAttr.getY(j);
+            avgZ += posAttr.getZ(j);
+          }
+          const n = nbrs.size;
+          avgX /= n; avgY /= n; avgZ /= n;
+          v.fromBufferAttribute(posAttr, idx);
+          const dist = v.distanceTo(brushPos);
+          const t = dist / brushRadius;
+          const w = Math.exp(-brushFalloff * t * t) * smoothFactor;
+          targets.push({
+            i: idx,
+            x: v.x + (avgX - v.x) * w,
+            y: v.y + (avgY - v.y) * w,
+            z: v.z + (avgZ - v.z) * w
+          });
+        }
+        // Write all at once to avoid read-after-write artifacts
+        for (const tgt of targets) {
+          posAttr.setXYZ(tgt.i, tgt.x, tgt.y, tgt.z);
+        }
+      } else {
+        // ── Push / Pull along each vertex's own normal ──
         for (let i = 0; i < posAttr.count; i++) {
           v.fromBufferAttribute(posAttr, i);
           const dist = v.distanceTo(brushPos);
           if (dist > brushRadius) continue;
           const t = dist / brushRadius;
           const w = Math.exp(-brushFalloff * t * t);
-          if (currentTool === 'sculpt-smooth') { smoothTargets.push(i); }
-          else { const delta = normalLocal.clone().multiplyScalar(dir * brushStrength * w); posAttr.setXYZ(i, v.x + delta.x, v.y + delta.y, v.z + delta.z); }
+          const strength = dir * scaledStrength * w;
+          const nx = normalAttr.getX(i);
+          const ny = normalAttr.getY(i);
+          const nz = normalAttr.getZ(i);
+          posAttr.setXYZ(i, v.x + nx * strength, v.y + ny * strength, v.z + nz * strength);
         }
-        if (currentTool === 'sculpt-smooth') {
-          smoothTargets.forEach(i => {
-            v.fromBufferAttribute(posAttr, i);
-            const t = v.distanceTo(brushPos) / brushRadius;
-            const w = Math.exp(-brushFalloff * t * t) * brushStrength * 8;
-            posAttr.setXYZ(i, v.x + (brushPos.x - v.x) * w, v.y + (brushPos.y - v.y) * w, v.z + (brushPos.z - v.z) * w);
-          });
+      }
+    }
+
+    function sculpt(event) {
+      if (!mesh) return;
+      const posAttr = mesh.geometry.attributes.position;
+      const normalAttr = mesh.geometry.attributes.normal;
+      const invMatrix = new THREE.Matrix4().copy(mesh.matrixWorld).invert();
+
+      const rect = viewport.getBoundingClientRect();
+      mouse.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
+      mouse.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
+      raycaster.setFromCamera(mouse, camera);
+      const hits = raycaster.intersectObject(mesh);
+      if (!hits.length) return; // Only sculpt when brush is on mesh
+
+      lastIntersect = hits[0];
+      const hitLocal = hits[0].point.clone().applyMatrix4(invMatrix);
+
+      // Interpolate between last and current brush position for smooth strokes
+      const positions = [hitLocal.clone()];
+      if (lastBrushLocal) {
+        const gap = lastBrushLocal.distanceTo(hitLocal);
+        const step = brushRadius * 0.3;
+        if (gap > step) {
+          const steps = Math.ceil(gap / step);
+          for (let s = 1; s < steps; s++)
+            positions.unshift(lastBrushLocal.clone().lerp(hitLocal, s / steps));
         }
-      });
+      }
+      lastBrushLocal = hitLocal.clone();
+
+      // Apply brush at each interpolated position
+      positions.forEach(bp => sculptStroke(bp, posAttr, normalAttr));
       posAttr.needsUpdate = true;
+
+      // Throttled normal recomputation for visual feedback during stroke
+      if (!normalRecomputeTimer) {
+        normalRecomputeTimer = setTimeout(() => {
+          if (mesh) {
+            mesh.geometry.computeVertexNormals();
+            mesh.geometry.attributes.normal.needsUpdate = true;
+          }
+          normalRecomputeTimer = null;
+        }, 80);
+      }
     }
 
     let sculpting_mousedown = false, savedForUndo = false;
@@ -1413,38 +1503,23 @@
 
     // Sculpt cursor + sculpt stroke
     canvas.addEventListener('mousemove', e => {
-      if (SCULPT_TOOLS.includes(currentTool)) {
-        const rect = viewport.getBoundingClientRect();
-        sculptCursor.style.left = (e.clientX - rect.left) + 'px';
-        sculptCursor.style.top = (e.clientY - rect.top) + 'px';
+      if (!SCULPT_TOOLS.includes(currentTool)) return;
+      const rect = viewport.getBoundingClientRect();
+      sculptCursor.style.left = (e.clientX - rect.left) + 'px';
+      sculptCursor.style.top = (e.clientY - rect.top) + 'px';
+      if (mesh) {
         mouse.x = ((e.clientX - rect.left) / rect.width) * 2 - 1;
         mouse.y = -((e.clientY - rect.top) / rect.height) * 2 + 1;
         raycaster.setFromCamera(mouse, camera);
-        if (mesh) {
-          const hits = raycaster.intersectObject(mesh);
-          if (hits.length) {
-            const sr = projectRadiusToScreen(hits[0].point, brushRadius);
-            sculptCursor.style.width = (sr * 2) + 'px';
-            sculptCursor.style.height = (sr * 2) + 'px';
-            if (sculpting_mousedown) {
-              lastHitPoint = hits[0].point.clone();
-              const invMatrix = new THREE.Matrix4().copy(mesh.matrixWorld).invert();
-              const hn = hits[0].face.normal.clone().transformDirection(mesh.matrixWorld).normalize();
-              lastNormalLocal = hn.clone().transformDirection(invMatrix).normalize();
-            }
-          } else if (sculpting_mousedown && lastHitPoint) {
-            // Missed mesh — project onto view plane at last hit depth
-            const plane = new THREE.Plane().setFromNormalAndCoplanarPoint(
-              camera.getWorldDirection(new THREE.Vector3()), lastHitPoint
-            );
-            const projected = new THREE.Vector3();
-            raycaster.ray.intersectPlane(plane, projected);
-            if (projected) lastHitPoint = projected;
-          }
-          if (sculpting_mousedown) {
-            if (!savedForUndo) { saveUndoState(); savedForUndo = true; }
-            sculpt(e, lastHitPoint, lastNormalLocal);
-          }
+        const hits = raycaster.intersectObject(mesh);
+        if (hits.length) {
+          const sr = projectRadiusToScreen(hits[0].point, brushRadius);
+          sculptCursor.style.width = (sr * 2) + 'px';
+          sculptCursor.style.height = (sr * 2) + 'px';
+        }
+        if (sculpting_mousedown) {
+          if (!savedForUndo) { saveUndoState(); savedForUndo = true; }
+          sculpt(e);
         }
       }
     });
@@ -1500,7 +1575,11 @@
     });
 
     canvas.addEventListener('mouseup', () => {
-      if (sculpting_mousedown && mesh) mesh.geometry.computeVertexNormals();
+      if (sculpting_mousedown && mesh) {
+        if (normalRecomputeTimer) { clearTimeout(normalRecomputeTimer); normalRecomputeTimer = null; }
+        mesh.geometry.computeVertexNormals();
+        mesh.geometry.attributes.normal.needsUpdate = true;
+      }
       sculpting_mousedown = false; savedForUndo = false; lastBrushLocal = null; lastHitPoint = null; lastNormalLocal = null;
       if (linkedDragging && mesh) {
         mesh.geometry.computeVertexNormals();
@@ -1513,7 +1592,11 @@
     });
 
     canvas.addEventListener('mouseleave', () => {
-      if (sculpting_mousedown && mesh) mesh.geometry.computeVertexNormals();
+      if (sculpting_mousedown && mesh) {
+        if (normalRecomputeTimer) { clearTimeout(normalRecomputeTimer); normalRecomputeTimer = null; }
+        mesh.geometry.computeVertexNormals();
+        mesh.geometry.attributes.normal.needsUpdate = true;
+      }
       sculpting_mousedown = false; lastBrushLocal = null;
       if (linkedDragging && mesh) { mesh.geometry.computeVertexNormals(); linkedDragging = false; }
     });
@@ -1554,7 +1637,11 @@
       if (mesh) { scene.remove(mesh); transformControls.detach(); }
       undoStack = [];
       document.getElementById('undo-btn').style.opacity = '0.4';
-      geometry.computeVertexNormals(); geometry.computeBoundingBox(); geometry.center();
+      geometry.computeBoundingBox(); geometry.center();
+      // Weld coincident vertices for seamless sculpting (STL files duplicate vertices per-face)
+      try { geometry = THREE.BufferGeometryUtils.mergeVertices(geometry, 1e-4); } catch(e) { console.warn('Vertex merge skipped:', e); }
+      geometry.computeVertexNormals();
+      adjacencyMap = buildAdjacency(geometry);
       const mat = new THREE.MeshStandardMaterial({
         color: new THREE.Color(document.getElementById('mesh-color').value),
         roughness: parseFloat(document.getElementById('roughness').value),
@@ -1562,17 +1649,26 @@
         side: THREE.DoubleSide,
       });
       mesh = new THREE.Mesh(geometry, mat);
-      mesh.castShadow = true; mesh.receiveShadow = true;
+      mesh.castShadow = true;
+      mesh.receiveShadow = false;  // Avoid self-shadowing artifacts on the mesh
       const box = new THREE.Box3().setFromObject(mesh);
       const size = box.getSize(new THREE.Vector3());
-      const dist = Math.max(size.x, size.y, size.z) * 2.5;
+      meshDiagonal = Math.max(size.x, size.y, size.z);
+      const dist = meshDiagonal * 2.5;
+      // Auto-scale brush radius to mesh size for natural feel
+      const autoRadius = Math.max(0.1, meshDiagonal * 0.06);
+      brushRadius = autoRadius;
+      document.getElementById('brush-radius').value = autoRadius;
+      document.getElementById('brush-radius').max = (meshDiagonal * 0.5).toFixed(1);
+      document.getElementById('brush-radius').step = (meshDiagonal * 0.002).toFixed(4);
+      document.getElementById('radius-val').textContent = autoRadius.toFixed(2);
       camera.position.set(dist * .6, dist * .5, dist * .8);
       orbitControls.target.set(0, 0, 0);
       mesh.position.y = size.y / 2;
       scene.add(mesh);
       document.getElementById('drop-zone').classList.add('hidden');
       const verts = geometry.attributes.position.count;
-      const tris = Math.round(verts / 3);
+      const tris = geometry.index ? Math.round(geometry.index.count / 3) : Math.round(verts / 3);
       document.getElementById('stat-verts').textContent = verts.toLocaleString();
       document.getElementById('stat-tris').textContent = tris.toLocaleString();
       document.getElementById('stat-dims').textContent = `${size.x.toFixed(1)}×${size.y.toFixed(1)}×${size.z.toFixed(1)}`;

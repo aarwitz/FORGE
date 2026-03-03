@@ -1047,7 +1047,6 @@
   <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/TransformControls.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/loaders/STLLoader.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/exporters/STLExporter.js"></script>
-  <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/utils/BufferGeometryUtils.js"></script>
 
   <script>
     // ═══════════════════════════════════════════════════════════════
@@ -1120,7 +1119,7 @@
     const raycaster = new THREE.Raycaster();
     const mouse = new THREE.Vector2();
     let lastIntersect = null;
-    let adjacencyMap = null;
+    let sculptData = null;
     let meshDiagonal = 1;
     let normalRecomputeTimer = null;
 
@@ -1346,29 +1345,108 @@
     }
 
     // ═══════════════════════════════════════════════════════════════
-    // VERTEX ADJACENCY (for Laplacian smooth)
+    // SCULPT DATA: coincidence groups for watertight STL sculpting
     // ═══════════════════════════════════════════════════════════════
-    function buildAdjacency(geometry) {
-      const count = geometry.attributes.position.count;
-      const neighbors = [];
-      for (let i = 0; i < count; i++) neighbors.push(new Set());
-      const index = geometry.index;
-      if (index) {
-        for (let i = 0; i < index.count; i += 3) {
-          const a = index.getX(i), b = index.getX(i + 1), c = index.getX(i + 2);
-          neighbors[a].add(b); neighbors[a].add(c);
-          neighbors[b].add(a); neighbors[b].add(c);
-          neighbors[c].add(a); neighbors[c].add(b);
+    // STL files store 3 separate vertices per triangle. To sculpt without
+    // tearing the mesh, we group all vertices at the same position and
+    // always move them together as one unit.
+    function buildSculptData(geometry) {
+      const posAttr = geometry.attributes.position;
+      const count = posAttr.count;
+      const posMap = new Map();
+      const groupOf = new Int32Array(count);
+      const groupIndices = [];
+      let numGroups = 0;
+
+      // Group vertices by quantised position
+      for (let i = 0; i < count; i++) {
+        const x = posAttr.getX(i), y = posAttr.getY(i), z = posAttr.getZ(i);
+        const key = ((x * 1e4) | 0) + ',' + ((y * 1e4) | 0) + ',' + ((z * 1e4) | 0);
+        if (!posMap.has(key)) {
+          posMap.set(key, numGroups);
+          groupIndices.push([]);
+          numGroups++;
         }
-      } else {
-        for (let i = 0; i < count; i += 3) {
-          const a = i, b = i + 1, c = i + 2;
-          neighbors[a].add(b); neighbors[a].add(c);
-          neighbors[b].add(a); neighbors[b].add(c);
-          neighbors[c].add(a); neighbors[c].add(b);
+        const g = posMap.get(key);
+        groupOf[i] = g;
+        groupIndices[g].push(i);
+      }
+
+      // Canonical position per group
+      const groupPos = new Float32Array(numGroups * 3);
+      for (let g = 0; g < numGroups; g++) {
+        const idx = groupIndices[g][0];
+        groupPos[g * 3]     = posAttr.getX(idx);
+        groupPos[g * 3 + 1] = posAttr.getY(idx);
+        groupPos[g * 3 + 2] = posAttr.getZ(idx);
+      }
+
+      // Averaged face-normal per group (smooth shading direction)
+      const groupNormal = new Float32Array(numGroups * 3);
+      const e1 = new THREE.Vector3(), e2 = new THREE.Vector3(), fn = new THREE.Vector3();
+      const v0 = new THREE.Vector3(), v1 = new THREE.Vector3(), v2 = new THREE.Vector3();
+      for (let f = 0; f < count; f += 3) {
+        v0.fromBufferAttribute(posAttr, f);
+        v1.fromBufferAttribute(posAttr, f + 1);
+        v2.fromBufferAttribute(posAttr, f + 2);
+        e1.subVectors(v1, v0); e2.subVectors(v2, v0);
+        fn.crossVectors(e1, e2);
+        const len = fn.length();
+        if (len > 1e-10) { fn.divideScalar(len); }
+        for (let k = 0; k < 3; k++) {
+          const g = groupOf[f + k];
+          groupNormal[g * 3]     += fn.x;
+          groupNormal[g * 3 + 1] += fn.y;
+          groupNormal[g * 3 + 2] += fn.z;
         }
       }
-      return neighbors;
+      for (let g = 0; g < numGroups; g++) {
+        const nx = groupNormal[g * 3], ny = groupNormal[g * 3 + 1], nz = groupNormal[g * 3 + 2];
+        const l = Math.sqrt(nx * nx + ny * ny + nz * nz) || 1;
+        groupNormal[g * 3] /= l; groupNormal[g * 3 + 1] /= l; groupNormal[g * 3 + 2] /= l;
+      }
+
+      // Group neighbours (groups that share at least one face)
+      const groupNeighbors = [];
+      for (let g = 0; g < numGroups; g++) groupNeighbors.push(new Set());
+      for (let f = 0; f < count; f += 3) {
+        const g0 = groupOf[f], g1 = groupOf[f + 1], g2 = groupOf[f + 2];
+        if (g0 !== g1) { groupNeighbors[g0].add(g1); groupNeighbors[g1].add(g0); }
+        if (g0 !== g2) { groupNeighbors[g0].add(g2); groupNeighbors[g2].add(g0); }
+        if (g1 !== g2) { groupNeighbors[g1].add(g2); groupNeighbors[g2].add(g1); }
+      }
+
+      return { groupOf, groupPos, groupNormal, groupNeighbors, groupIndices, numGroups };
+    }
+
+    function recomputeGroupNormals() {
+      const sd = sculptData;
+      if (!sd || !mesh) return;
+      const posAttr = mesh.geometry.attributes.position;
+      const count = posAttr.count;
+      sd.groupNormal.fill(0);
+      const e1 = new THREE.Vector3(), e2 = new THREE.Vector3(), fn = new THREE.Vector3();
+      const v0 = new THREE.Vector3(), v1 = new THREE.Vector3(), v2 = new THREE.Vector3();
+      for (let f = 0; f < count; f += 3) {
+        v0.fromBufferAttribute(posAttr, f);
+        v1.fromBufferAttribute(posAttr, f + 1);
+        v2.fromBufferAttribute(posAttr, f + 2);
+        e1.subVectors(v1, v0); e2.subVectors(v2, v0);
+        fn.crossVectors(e1, e2);
+        const len = fn.length();
+        if (len > 1e-10) fn.divideScalar(len);
+        for (let k = 0; k < 3; k++) {
+          const g = sd.groupOf[f + k];
+          sd.groupNormal[g * 3]     += fn.x;
+          sd.groupNormal[g * 3 + 1] += fn.y;
+          sd.groupNormal[g * 3 + 2] += fn.z;
+        }
+      }
+      for (let g = 0; g < sd.numGroups; g++) {
+        const nx = sd.groupNormal[g * 3], ny = sd.groupNormal[g * 3 + 1], nz = sd.groupNormal[g * 3 + 2];
+        const l = Math.sqrt(nx * nx + ny * ny + nz * nz) || 1;
+        sd.groupNormal[g * 3] /= l; sd.groupNormal[g * 3 + 1] /= l; sd.groupNormal[g * 3 + 2] /= l;
+      }
     }
 
     // ═══════════════════════════════════════════════════════════════
@@ -1391,64 +1469,65 @@
 
     let lastBrushLocal = null;
 
-    // Per-stroke brush application: push/pull along per-vertex normals, smooth via Laplacian
-    function sculptStroke(brushPos, posAttr, normalAttr) {
-      const v = new THREE.Vector3();
+    // Apply one brush dab at brushPos. All coincident vertices move together.
+    function sculptStroke(brushPos, posAttr, viewDirLocal) {
+      const sd = sculptData;
+      if (!sd) return;
       const dir = currentTool === 'sculpt-push' ? -1 : 1;
-      // Scale strength proportionally to mesh size so brush feels consistent
       const scaledStrength = brushStrength * meshDiagonal * 0.15;
 
       if (currentTool === 'sculpt-smooth') {
-        // ── Laplacian smoothing using real vertex adjacency ──
-        if (!adjacencyMap) return;
-        const affected = [];
-        for (let i = 0; i < posAttr.count; i++) {
-          v.fromBufferAttribute(posAttr, i);
-          if (v.distanceTo(brushPos) <= brushRadius) affected.push(i);
-        }
-        // Clamp smooth factor for stability (never overshoot)
+        // ── Laplacian smooth between vertex groups ──
         const smoothFactor = Math.min(brushStrength * 15, 0.75);
-        // Pre-compute all Laplacian targets before writing (Jacobi iteration)
         const targets = [];
-        for (const idx of affected) {
-          const nbrs = adjacencyMap[idx];
-          if (!nbrs || nbrs.size === 0) continue;
+        for (let g = 0; g < sd.numGroups; g++) {
+          const gx = sd.groupPos[g * 3], gy = sd.groupPos[g * 3 + 1], gz = sd.groupPos[g * 3 + 2];
+          const dx = gx - brushPos.x, dy = gy - brushPos.y, dz = gz - brushPos.z;
+          const dist = Math.sqrt(dx * dx + dy * dy + dz * dz);
+          if (dist > brushRadius) continue;
+          const nbrs = sd.groupNeighbors[g];
+          if (nbrs.size === 0) continue;
           let avgX = 0, avgY = 0, avgZ = 0;
           for (const j of nbrs) {
-            avgX += posAttr.getX(j);
-            avgY += posAttr.getY(j);
-            avgZ += posAttr.getZ(j);
+            avgX += sd.groupPos[j * 3];
+            avgY += sd.groupPos[j * 3 + 1];
+            avgZ += sd.groupPos[j * 3 + 2];
           }
-          const n = nbrs.size;
-          avgX /= n; avgY /= n; avgZ /= n;
-          v.fromBufferAttribute(posAttr, idx);
-          const dist = v.distanceTo(brushPos);
+          avgX /= nbrs.size; avgY /= nbrs.size; avgZ /= nbrs.size;
           const t = dist / brushRadius;
           const w = Math.exp(-brushFalloff * t * t) * smoothFactor;
-          targets.push({
-            i: idx,
-            x: v.x + (avgX - v.x) * w,
-            y: v.y + (avgY - v.y) * w,
-            z: v.z + (avgZ - v.z) * w
-          });
+          targets.push({ g, x: gx + (avgX - gx) * w, y: gy + (avgY - gy) * w, z: gz + (avgZ - gz) * w });
         }
-        // Write all at once to avoid read-after-write artifacts
+        // Write all at once (Jacobi) so reads don't see partial writes
         for (const tgt of targets) {
-          posAttr.setXYZ(tgt.i, tgt.x, tgt.y, tgt.z);
+          sd.groupPos[tgt.g * 3] = tgt.x; sd.groupPos[tgt.g * 3 + 1] = tgt.y; sd.groupPos[tgt.g * 3 + 2] = tgt.z;
+          for (const idx of sd.groupIndices[tgt.g]) posAttr.setXYZ(idx, tgt.x, tgt.y, tgt.z);
         }
       } else {
-        // ── Push / Pull along each vertex's own normal ──
-        for (let i = 0; i < posAttr.count; i++) {
-          v.fromBufferAttribute(posAttr, i);
-          const dist = v.distanceTo(brushPos);
+        // ── Push / Pull along group normal (pull) or view direction (push) ──
+        for (let g = 0; g < sd.numGroups; g++) {
+          const gx = sd.groupPos[g * 3], gy = sd.groupPos[g * 3 + 1], gz = sd.groupPos[g * 3 + 2];
+          const dx = gx - brushPos.x, dy = gy - brushPos.y, dz = gz - brushPos.z;
+          const dist = Math.sqrt(dx * dx + dy * dy + dz * dz);
           if (dist > brushRadius) continue;
           const t = dist / brushRadius;
           const w = Math.exp(-brushFalloff * t * t);
-          const strength = dir * scaledStrength * w;
-          const nx = normalAttr.getX(i);
-          const ny = normalAttr.getY(i);
-          const nz = normalAttr.getZ(i);
-          posAttr.setXYZ(i, v.x + nx * strength, v.y + ny * strength, v.z + nz * strength);
+          const s = scaledStrength * w;
+          let mx, my, mz;
+          if (currentTool === 'sculpt-push') {
+            // Push: move along view direction (press into the surface)
+            mx = viewDirLocal.x * s;
+            my = viewDirLocal.y * s;
+            mz = viewDirLocal.z * s;
+          } else {
+            // Pull: move outward along surface normal
+            mx = sd.groupNormal[g * 3] * s;
+            my = sd.groupNormal[g * 3 + 1] * s;
+            mz = sd.groupNormal[g * 3 + 2] * s;
+          }
+          const newX = gx + mx, newY = gy + my, newZ = gz + mz;
+          sd.groupPos[g * 3] = newX; sd.groupPos[g * 3 + 1] = newY; sd.groupPos[g * 3 + 2] = newZ;
+          for (const idx of sd.groupIndices[g]) posAttr.setXYZ(idx, newX, newY, newZ);
         }
       }
     }
@@ -1456,7 +1535,6 @@
     function sculpt(event) {
       if (!mesh) return;
       const posAttr = mesh.geometry.attributes.position;
-      const normalAttr = mesh.geometry.attributes.normal;
       const invMatrix = new THREE.Matrix4().copy(mesh.matrixWorld).invert();
 
       const rect = viewport.getBoundingClientRect();
@@ -1464,12 +1542,16 @@
       mouse.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
       raycaster.setFromCamera(mouse, camera);
       const hits = raycaster.intersectObject(mesh);
-      if (!hits.length) return; // Only sculpt when brush is on mesh
+      if (!hits.length) return;
 
       lastIntersect = hits[0];
       const hitLocal = hits[0].point.clone().applyMatrix4(invMatrix);
 
-      // Interpolate between last and current brush position for smooth strokes
+      // View direction in local space (for push tool)
+      const viewDirLocal = camera.getWorldDirection(new THREE.Vector3())
+        .transformDirection(invMatrix).normalize();
+
+      // Interpolate between last and current brush pos for smooth strokes
       const positions = [hitLocal.clone()];
       if (lastBrushLocal) {
         const gap = lastBrushLocal.distanceTo(hitLocal);
@@ -1482,11 +1564,10 @@
       }
       lastBrushLocal = hitLocal.clone();
 
-      // Apply brush at each interpolated position
-      positions.forEach(bp => sculptStroke(bp, posAttr, normalAttr));
+      positions.forEach(bp => sculptStroke(bp, posAttr, viewDirLocal));
       posAttr.needsUpdate = true;
 
-      // Throttled normal recomputation for visual feedback during stroke
+      // Throttled visual normal recomputation during stroke
       if (!normalRecomputeTimer) {
         normalRecomputeTimer = setTimeout(() => {
           if (mesh) {
@@ -1579,6 +1660,7 @@
         if (normalRecomputeTimer) { clearTimeout(normalRecomputeTimer); normalRecomputeTimer = null; }
         mesh.geometry.computeVertexNormals();
         mesh.geometry.attributes.normal.needsUpdate = true;
+        recomputeGroupNormals(); // refresh sculpt normals for next stroke
       }
       sculpting_mousedown = false; savedForUndo = false; lastBrushLocal = null; lastHitPoint = null; lastNormalLocal = null;
       if (linkedDragging && mesh) {
@@ -1596,6 +1678,7 @@
         if (normalRecomputeTimer) { clearTimeout(normalRecomputeTimer); normalRecomputeTimer = null; }
         mesh.geometry.computeVertexNormals();
         mesh.geometry.attributes.normal.needsUpdate = true;
+        recomputeGroupNormals();
       }
       sculpting_mousedown = false; lastBrushLocal = null;
       if (linkedDragging && mesh) { mesh.geometry.computeVertexNormals(); linkedDragging = false; }
@@ -1638,10 +1721,8 @@
       undoStack = [];
       document.getElementById('undo-btn').style.opacity = '0.4';
       geometry.computeBoundingBox(); geometry.center();
-      // Weld coincident vertices for seamless sculpting (STL files duplicate vertices per-face)
-      try { geometry = THREE.BufferGeometryUtils.mergeVertices(geometry, 1e-4); } catch(e) { console.warn('Vertex merge skipped:', e); }
       geometry.computeVertexNormals();
-      adjacencyMap = buildAdjacency(geometry);
+      sculptData = buildSculptData(geometry);
       const mat = new THREE.MeshStandardMaterial({
         color: new THREE.Color(document.getElementById('mesh-color').value),
         roughness: parseFloat(document.getElementById('roughness').value),
